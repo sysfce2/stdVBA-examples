@@ -1,0 +1,21 @@
+{
+  "name": "data-pipelines-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "@retejs/lit-plugin": "*",
+    "lit": "*",
+    "monaco-editor": "*",
+    "rete": "*",
+    "rete-area-plugin": "*",
+    "rete-connection-plugin": "*"
+  },
+  "devDependencies": {
+    "esbuild": "*",
+    "typescript": "*"
+  }
+}

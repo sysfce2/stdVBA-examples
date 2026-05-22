@@ -1,0 +1,171 @@
+import "./chunk-FOYMJMJR.js";
+
+// src/stdLambdaLanguage.ts
+var isRegistered = false;
+function ensureStdLambdaLanguage(monaco) {
+  if (isRegistered) return;
+  isRegistered = true;
+  monaco.languages.register({ id: "stdLambda" });
+  monaco.languages.setMonarchTokensProvider("stdLambda", {
+    tokenizer: {
+      root: [
+        [/^\s*=/, "keyword"],
+        [/\$\d+/, "variable"],
+        [/!/, "delimiter"],
+        [/\b(true|false|null)\b/i, "keyword"],
+        [/\b\d+(\.\d+)?\b/, "number"],
+        [/>=|<=|<>|=|>|<|&|\+|-|\*|\//, "operator"],
+        [/"/, "string.quote", "@doubleString"],
+        [/'/, "string.quote", "@singleString"],
+        [/[A-Za-z_$][\w$]*/, "identifier"],
+        [/\s+/, "white"]
+      ],
+      doubleString: [
+        [/[^\\"]+/, "string"],
+        [/\\./, "string.escape"],
+        [/"/, "string.quote", "@pop"]
+      ],
+      singleString: [
+        [/[^\\']+/, "string"],
+        [/\\./, "string.escape"],
+        [/'/, "string.quote", "@pop"]
+      ]
+    }
+  });
+  monaco.editor.defineTheme("stdLambda-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "variable", foreground: "93C5FD" },
+      { token: "delimiter", foreground: "60A5FA" },
+      { token: "identifier", foreground: "E2E8F0" },
+      { token: "operator", foreground: "60A5FA" },
+      { token: "keyword", foreground: "22D3EE" },
+      { token: "number", foreground: "FBBF24" },
+      { token: "string", foreground: "86EFAC" }
+    ],
+    colors: {
+      "editor.background": "#080D1A",
+      "editor.foreground": "#E2E8F0",
+      "editorLineNumber.foreground": "#334155",
+      "editorLineNumber.activeForeground": "#64748B",
+      "editorCursor.foreground": "#93C5FD",
+      "editor.selectionBackground": "#1E3A8A55",
+      "editor.inactiveSelectionBackground": "#1E3A8A33"
+    }
+  });
+}
+
+// src/lambdaEditor.ts
+var monacoPromise = null;
+var completionRegistered = false;
+var editors = [];
+function uniqueFieldNames(fields) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const field of fields) {
+    const name = String(field || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+function registerCompletionProvider(monaco, getFields) {
+  if (completionRegistered) return;
+  completionRegistered = true;
+  monaco.languages.registerCompletionItemProvider("stdLambda", {
+    triggerCharacters: ["!", "$"],
+    provideCompletionItems(model, position) {
+      const line = model.getLineContent(position.lineNumber);
+      const prefix = line.slice(0, Math.max(0, position.column - 1));
+      const match = prefix.match(/\$(\d+)!([\w$]*!)*([\w$]*)$/);
+      if (!match) {
+        return {
+          suggestions: [
+            {
+              label: "$1!FieldName",
+              kind: monaco.languages.CompletionItemKind.Snippet,
+              insertText: "$1!FieldName",
+              detail: "Row field reference"
+            }
+          ]
+        };
+      }
+      const typed = match[3] ?? "";
+      const fields = uniqueFieldNames(getFields());
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: Math.max(1, position.column - typed.length),
+        endColumn: position.column
+      };
+      const suggestions = fields.filter((field) => field.toLowerCase().startsWith(typed.toLowerCase())).map((field) => ({
+        label: field,
+        kind: monaco.languages.CompletionItemKind.Field,
+        detail: "$1!FieldName",
+        insertText: field,
+        range
+      }));
+      if (suggestions.length === 0) {
+        suggestions.push({
+          label: "$1!FieldName",
+          kind: monaco.languages.CompletionItemKind.Snippet,
+          insertText: "$1!FieldName",
+          detail: "Row field reference",
+          range
+        });
+      }
+      return { suggestions };
+    }
+  });
+}
+async function getMonaco(getFields) {
+  if (!monacoPromise) {
+    monacoPromise = import("./editor.api-IYEPNGQG.js").then((monaco2) => {
+      globalThis.MonacoEnvironment = {
+        getWorker() {
+          return new Worker(new URL("./editor.worker.js", import.meta.url), { type: "module" });
+        }
+      };
+      ensureStdLambdaLanguage(monaco2);
+      return monaco2;
+    });
+  }
+  const monaco = await monacoPromise;
+  registerCompletionProvider(monaco, getFields);
+  return monaco;
+}
+async function createLambdaEditor(container, value, onChange, getFields) {
+  const host = document.createElement("div");
+  host.className = "cfg-lambda-editor";
+  container.appendChild(host);
+  const monaco = await getMonaco(getFields);
+  const editor = monaco.editor.create(host, {
+    value: value || "",
+    language: "stdLambda",
+    theme: "stdLambda-dark",
+    minimap: { enabled: false },
+    lineNumbers: "off",
+    wordWrap: "on",
+    scrollBeyondLastLine: false,
+    automaticLayout: true,
+    fontSize: 13,
+    padding: { top: 6, bottom: 6 }
+  });
+  const subscription = editor.onDidChangeModelContent(() => {
+    onChange(editor.getValue());
+  });
+  editors.push({ editor, subscription });
+}
+function disposeLambdaEditors() {
+  while (editors.length > 0) {
+    const item = editors.pop();
+    item?.subscription?.dispose?.();
+    item?.editor?.dispose?.();
+  }
+}
+export {
+  createLambdaEditor,
+  disposeLambdaEditors
+};
