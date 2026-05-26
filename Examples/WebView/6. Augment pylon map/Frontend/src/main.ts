@@ -61,6 +61,7 @@ let scribbleBaseMapCache: unknown = null;
 let scribbleBaseMapCacheAt = 0;
 let nativeLeafletMap: Record<string, unknown> | null = null;
 let nativeLeafletLayers: unknown[] = [];
+let initialOverlayRetryHandle: number | null = null;
 
 function getHostBridge(): HostBridge | null {
   return (window as any)?.chrome?.webview?.hostObjects?.vba ?? null;
@@ -802,6 +803,68 @@ function clonePoint(point: GeoPoint): GeoPoint {
   };
 }
 
+function parseLinePoints(candidate: unknown): GeoPoint[] | null {
+  if (!candidate || typeof candidate !== "object") return null;
+
+  const source = candidate as Record<string, unknown>;
+  const maybeGeometry =
+    source.type === "Feature" && source.geometry && typeof source.geometry === "object"
+      ? (source.geometry as Record<string, unknown>)
+      : source;
+
+  if (maybeGeometry.type !== "LineString" || !Array.isArray(maybeGeometry.coordinates)) {
+    return null;
+  }
+
+  const points: GeoPoint[] = [];
+  for (const coordinate of maybeGeometry.coordinates) {
+    if (!Array.isArray(coordinate) || coordinate.length < 2) continue;
+    const lon = Number(coordinate[0]);
+    const lat = Number(coordinate[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isLatLonInRange(lat, lon)) continue;
+    points.push({ lat, lon, clientX: 0, clientY: 0 });
+  }
+
+  return points.length >= 2 ? points : null;
+}
+
+async function persistLineToHost(points: GeoPoint[]) {
+  if (!hostAvailable()) return;
+
+  const shape = {
+    type: "LineString",
+    coordinates: points.map((point) => [point.lon, point.lat])
+  };
+
+  await callHost("AddLine", JSON.stringify(shape));
+}
+
+async function loadLinesFromHost() {
+  if (!hostAvailable()) return;
+
+  const payload = await callHost<unknown>("GetLines");
+  if (typeof payload !== "string" || payload.trim() === "") return;
+
+  const rawLines = JSON.parse(payload);
+  if (!Array.isArray(rawLines)) return;
+
+  const loadedLines: GeoPoint[][] = [];
+  for (const rawLine of rawLines) {
+    try {
+      const candidate = typeof rawLine === "string" ? JSON.parse(rawLine) : rawLine;
+      const points = parseLinePoints(candidate);
+      if (points) loadedLines.push(points);
+    } catch {
+      // Ignore malformed row payloads and continue loading other lines.
+    }
+  }
+
+  if (loadedLines.length > 0) {
+    completedLinePoints = loadedLines;
+    ensureLoadedLinesRendered();
+  }
+}
+
 function sameLocation(a: GeoPoint, b: GeoPoint): boolean {
   return Math.abs(a.lat - b.lat) < 0.0000001 && Math.abs(a.lon - b.lon) < 0.0000001;
 }
@@ -813,15 +876,48 @@ function appendLinePoint(point: GeoPoint) {
   }
 }
 
-function renderLineOverlay() {
+function renderLineOverlay(): boolean {
   const baseMap = getScribbleBaseMap();
   if (!baseMap) {
     clearNativeLeafletOverlay();
-    return;
+    return false;
   }
   if (!renderNativeLeafletOverlay(baseMap)) {
     clearNativeLeafletOverlay();
+    return false;
   }
+  return true;
+}
+
+function stopInitialOverlayRetry() {
+  if (initialOverlayRetryHandle !== null) {
+    window.clearTimeout(initialOverlayRetryHandle);
+    initialOverlayRetryHandle = null;
+  }
+}
+
+function ensureLoadedLinesRendered() {
+  stopInitialOverlayRetry();
+  if (completedLinePoints.length === 0) return;
+
+  const startedAt = Date.now();
+  const attemptRender = () => {
+    if (completedLinePoints.length === 0) {
+      stopInitialOverlayRetry();
+      return;
+    }
+    if (renderLineOverlay()) {
+      stopInitialOverlayRetry();
+      return;
+    }
+    if (Date.now() - startedAt >= 10000) {
+      stopInitialOverlayRetry();
+      return;
+    }
+    initialOverlayRetryHandle = window.setTimeout(attemptRender, 150);
+  };
+
+  attemptRender();
 }
 
 function canRenderNativeLeaflet(baseMap: Record<string, unknown> | null): boolean {
@@ -944,11 +1040,9 @@ function stopLine() {
 
   if (finalizedLine.length >= 2) {
     completedLinePoints.push(finalizedLine);
-    const shape = {
-      type: "LineString",
-      coordinates: finalizedLine.map((point) => [point.lon, point.lat])
-    };
-    console.log("New line shape", shape);
+    void persistLineToHost(finalizedLine).catch(() => {
+      // Keep UI responsive if host persistence fails.
+    });
   }
 
   updateMenuContent();
@@ -1102,6 +1196,7 @@ function resetState() {
   lastMiddleCapture = "";
   scribbleBaseMapCache = null;
   scribbleBaseMapCacheAt = 0;
+  stopInitialOverlayRetry();
   clearNativeLeafletOverlay();
 }
 
@@ -1128,6 +1223,12 @@ async function mount() {
   window.addEventListener("resize", handleWindowChanged);
   window.removeEventListener("scroll", handleWindowChanged, true);
   window.addEventListener("scroll", handleWindowChanged, true);
+
+  try {
+    await loadLinesFromHost();
+  } catch {
+    // Keep runtime interactive if host-backed line hydration fails.
+  }
 
   const message = hostAvailable()
     ? `Augment active on ${describeTarget()}`
