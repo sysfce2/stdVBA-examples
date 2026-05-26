@@ -1,0 +1,16 @@
+{
+  "name": "augment-pylon-map-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "dependencies": {
+    "proj4": "^2.20.8"
+  },
+  "devDependencies": {
+    "esbuild": "*",
+    "typescript": "*"
+  }
+}
