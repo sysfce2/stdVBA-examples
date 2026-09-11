@@ -42,7 +42,7 @@ Attribute VB_Exposed = False
 '```
 '@example Using chaining to build a JSON object:
 '```vb
-' With stdJSON.Create()                '{          
+' With stdJSON.Create()                '{
 '   With .addObject("key")             '  "key": {
 '     .add "a", 1                      '    "a": 1,
 '     .add "b", "hello"                '    "b": "hello",
@@ -206,7 +206,7 @@ Friend Sub protInitFromVariant(ByRef vData As Variant)
   Dim vItem As Variant
   Select Case VarType(vData)
     Case vbObject
-      Select Case TypeName(vData)
+      Select Case typeName(vData)
         Case "Collection"
           This.iType = eJSONArray
           Set This.children = New Collection
@@ -227,16 +227,16 @@ Friend Sub protInitFromVariant(ByRef vData As Variant)
 
           'Get keys and values...
           With vData
-            Dim vKeys: vKeys = .keys()
+            Dim vKeys: vKeys = .Keys()
             Dim vVals: vVals = .items()
           End With
 
           'Add to dict
-          For i = 1 To vData.Count
+          For i = 1 To vData.count
             If IsObject(vVals(i - 1)) Then
-              Call This.children.add(vKeys(i - 1), stdJSON.CreateFromVariant(vVals(i - 1)))
+              Call This.children.Add(vKeys(i - 1), stdJSON.CreateFromVariant(vVals(i - 1)))
             Else
-              Call This.children.add(vKeys(i - 1), vVals(i - 1))
+              Call This.children.Add(vKeys(i - 1), vVals(i - 1))
             End If
           Next
       End Select
@@ -264,19 +264,19 @@ End Sub
 '@returns - if value was a stdJSON, this is returned, else `Nothing`.
 '@remark Uses `protAddItem_JSONArray` when `This.iType == eJSONArray`; and `protAddItem_JSONObject` when `This.iType == eJSONObject`.
 Public Function Add(ParamArray v()) As stdJSON
-  Dim key,item
+  Dim key, Item
   Select Case This.iType
     Case eJSONObject
       key = v(0)
-      Call CopyVariant(item, v(1))
-      Call This.children.add(key, item)
+      Call CopyVariant(Item, v(1))
+      Call This.children.Add(key, Item)
     Case eJSONArray
-      Call CopyVariant(item, v(0))
-      Call This.children.add(item)
+      Call CopyVariant(Item, v(0))
+      Call This.children.Add(Item)
   End Select
-  If IsObject(item) Then 
-    if item is nothing then Exit Function
-    If TypeOf item Is stdJSON Then Set Add = item
+  If IsObject(Item) Then
+    If Item Is Nothing Then Exit Function
+    If TypeOf Item Is stdJSON Then Set Add = Item
   End If
 End Function
 
@@ -343,25 +343,25 @@ Public Property Get Item(ByVal keyOrIndex As Variant) As Variant
 Attribute Item.VB_UserMemId = 0
   Select Case This.iType
     Case eJSONObject
-      Call CopyVariant(Item, This.children.item(keyOrIndex))
+      Call CopyVariant(Item, This.children.Item(keyOrIndex))
     Case eJSONArray
-      Call CopyVariant(Item, This.children.item(keyOrIndex))
+      Call CopyVariant(Item, This.children.Item(keyOrIndex))
   End Select
 End Property
 Public Property Let Item(ByVal keyOrIndex As Variant, v As Variant)
   Select Case This.iType
     Case eJSONObject
-      This.children.item(keyOrIndex) = v
+      This.children.Item(keyOrIndex) = v
     Case eJSONArray
-      This.children.item(keyOrIndex) = v
+      This.children.Item(keyOrIndex) = v
   End Select
 End Property
 Public Property Set Item(ByVal keyOrIndex As Variant, v As Variant)
   Select Case This.iType
     Case eJSONObject
-      Set This.children.item(keyOrIndex) = v
+      Set This.children.Item(keyOrIndex) = v
     Case eJSONArray
-      Set This.children.item(keyOrIndex) = v
+      Set This.children.Item(keyOrIndex) = v
   End Select
 End Property
 
@@ -371,7 +371,7 @@ End Property
 Public Property Get Exists(ByVal keyOrIndex As Variant) As Boolean
   Select Case This.iType
     Case eJSONObject
-      Exists = This.children.exists(keyOrIndex)
+      Exists = This.children.Exists(keyOrIndex)
     Case eJSONArray
       Exists = keyOrIndex <= This.children.count And keyOrIndex > 0
   End Select
@@ -438,11 +438,15 @@ Public Function ToString(Optional ByVal pretty As Boolean = False, Optional ByVa
   Select Case This.iType
     Case eJSONObject
       Dim vVals: vVals = This.children.items()
-      Dim vKeys: vKeys = This.children.keys()
+      Dim vKeys: vKeys = This.children.Keys()
       ub = UBound(vKeys)
       For i = 0 To ub
-        If TypeOf vVals(i) Is stdJSON Then
-          sValue = LTrim(vVals(i).ToString(pretty, prettyIndent, depth + 1))
+        If VarType(vVals(i)) = vbObject Then
+          If vVals(i) Is Nothing Then
+            sValue = "null"
+          ElseIf TypeOf vVals(i) Is stdJSON Then
+            sValue = LTrim(vVals(i).ToString(pretty, prettyIndent, depth + 1))
+          End If
         Else
           sValue = simpleStringify(vVals(i))
         End If
@@ -503,22 +507,22 @@ Public Function ToVBObject() As Object
   Select Case This.iType
     Case eJSONObject
       Dim vVals: vVals = This.children.items()
-      Dim vKeys: vKeys = This.children.keys()
+      Dim vKeys: vKeys = This.children.Keys()
       ub = UBound(vKeys)
       For i = 0 To ub
         If TypeOf vVals(i) Is stdJSON Then
-          ret.add vKeys(i), vVals(i).ToVBObject
+          ret.Add vKeys(i), vVals(i).ToVBObject
         Else
-          ret.add vKeys(i), vVals(i)
+          ret.Add vKeys(i), vVals(i)
         End If
       Next
     Case eJSONArray
       Dim vItem
       For Each vItem In This.children
         If TypeOf vItem Is stdJSON Then
-          ret.add vItem.ToVBObject
+          ret.Add vItem.ToVBObject
         Else
-          ret.add vItem
+          ret.Add vItem
         End If
       Next
   End Select
@@ -563,11 +567,11 @@ End Function
 'Helper: Copy variant from one location to another
 '@param dest - Destination variant
 '@param src - Source variant
-Private Sub CopyVariant(ByRef dest As Variant, ByVal src As Variant)
+Private Sub CopyVariant(ByRef Dest As Variant, ByVal src As Variant)
   If IsObject(src) Then
-    Set dest = src
+    Set Dest = src
   Else
-    Let dest = src
+    Let Dest = src
   End If
 End Sub
 
@@ -759,7 +763,7 @@ Private Function parseNumber(ByRef sJSON As String, ByRef index As Long) As Doub
   If This.parserProps.StoreLargeNumsAsString And Len(sNum) >= 16 Then
     parseNumber = sNum
   Else
-    parseNumber = Val(sNum)
+    parseNumber = val(sNum)
   End If
 End Function
 
@@ -881,10 +885,10 @@ Private Function CreateDictionary(ParamArray children()) As Object
   #Else
     Set CreateDictionary = New Scripting.Dictionary
   #End If
-  CreateDictionary.CompareMode = vbTextCompare
+  CreateDictionary.compareMode = vbBinaryCompare
 
   Dim i As Long
   For i = LBound(children) To UBound(children) Step 2
-    Call CreateDictionary.add(children(i), children(i + 1))
+    Call CreateDictionary.Add(children(i), children(i + 1))
   Next
 End Function

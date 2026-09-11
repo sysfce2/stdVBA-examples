@@ -4,7 +4,9 @@ This project is primarily a reusable SharePoint integration toolkit for VBA, cen
 - `src/stdSharepointAuthenticator.frm` for browser-session authentication and cookie injection.
 - `src/stdSharepointList.cls` for SharePoint list CRUD, querying, transforms, and batching.
 
-`examples/ORMMissingData/*` is an example implementation showing how to build a typed wrapper on top of these core components.
+Examples:
+- `examples/ORMMissingData/*` — typed wrapper for a specific business list.
+- `examples/GenericUpdater/*` — range-based generic batch updater driven by SiteURL + ListTitle.
 
 ## Core components
 
@@ -44,13 +46,35 @@ Set rows = list.ItemsGet()
 Debug.Print rows.Length
 ```
 
-## Example folder
+You can also construct a list client from site URL + display title:
+
+```vb
+Set list = stdSharepointList.CreateFromTitle( _
+  "https://contoso.sharepoint.com/sites/Projects", _
+  "Risks", _
+  auth _
+)
+Dim schema As stdJSON
+Set schema = list.FieldsFetchSchema()
+```
+
+## Example folders
+
+### ORMMissingData (typed wrapper)
 
 - `examples/ORMMissingData/ORMMissingDataRow.cls`
 - `examples/ORMMissingData/ContosoAuth.bas`
 - `examples/ORMMissingData/mMain.bas`
 
-These files are sample domain code that demonstrates one way to wrap `stdSharepointList` for a specific business list. They are not the main library surface.
+Sample domain code that wraps `stdSharepointList` for a specific business list. Not the main library surface.
+
+### GenericUpdater (range-based batch updater)
+
+- [`examples/GenericUpdater/README.md`](examples/GenericUpdater/README.md) — full usage, cell encoding, and field-type special cases (person email, multi-value splits, `null` clears, etc.)
+- `examples/GenericUpdater/src/GenericUpdater.bas`
+- `examples/GenericUpdater/src/mMain.bas`
+
+Range-driven Create/Update for arbitrary lists (`UpdateList`, `DumpResults`, `EnsureTableFields`). Demo macros: `mainRunGenericUpdater`, `mainFetchFields`.
 
 ## Requirements
 

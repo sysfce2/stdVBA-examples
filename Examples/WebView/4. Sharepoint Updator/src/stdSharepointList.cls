@@ -76,13 +76,13 @@ Private Type TFieldDef
 End Type
 
 Private Type TThis
-  SiteUrl As String
+  SiteURL As String
   ListTitle As String
-  ListRelativePath As String
+  listRelativePath As String
   ListTitleResolved As Boolean
 
   Authenticator As stdICallable
-  Fields() As TFieldDef
+  fields() As TFieldDef
   FieldsCount As Long
   UserIdCache As Object
 
@@ -116,6 +116,25 @@ Public Function Create( _
   Set Create = instance
 End Function
 
+'Create a SharePoint list client from a site URL and list display title.
+'@constructor
+'@param SiteUrl - Absolute SharePoint site URL (for example `https://contoso.sharepoint.com/sites/Projects`).
+'@param ListTitle - List display title used by `GetByTitle`.
+'@param Authenticator as stdICallable<(HTTP: Object, RequestMethod: String, URL: String, ThreadingStyle: Long, options: Variant)=>Void> - Authenticator used by `stdHTTP`.
+'@param AutoDiscoverFields - If true, attempts to infer fields from SharePoint metadata.
+'@returns - A configured `stdSharepointList` instance.
+Public Function CreateFromTitle( _
+  ByVal SiteURL As String, _
+  ByVal ListTitle As String, _
+  ByVal Authenticator As stdICallable, _
+  Optional ByVal AutoDiscoverFields As Boolean = False _
+) As stdSharepointList
+  Dim instance As stdSharepointList
+  Set instance = New stdSharepointList
+  Call instance.protInitFromTitle(SiteURL, ListTitle, Authenticator, AutoDiscoverFields)
+  Set CreateFromTitle = instance
+End Function
+
 'Initialize list state, schema containers, and caches.
 '@protected
 '@param ListUrl - List page URL (for example `/sites/X/Lists/MyList/AllItems.aspx`).
@@ -126,8 +145,8 @@ Public Sub protInit( _
   ByVal Authenticator As stdICallable, _
   Optional ByVal AutoDiscoverFields As Boolean = False _
 )
-  Dim siteUrl As String
-  Dim listTitle As String
+  Dim SiteURL As String
+  Dim ListTitle As String
   Dim relPath As String
 
   If LenB(Trim$(ListUrl)) = 0 Then
@@ -137,15 +156,63 @@ Public Sub protInit( _
     Err.Raise 5, "stdSharepointList::protInit", "Authenticator cannot be Nothing."
   End If
 
-  Call ParseListUrl(ListUrl, siteUrl, listTitle, relPath)
+  Call ParseListUrl(ListUrl, SiteURL, ListTitle, relPath)
 
-  This.SiteUrl = siteUrl
-  This.ListTitle = listTitle
-  This.ListRelativePath = relPath
+  This.SiteURL = SiteURL
+  This.ListTitle = ListTitle
+  This.listRelativePath = relPath
   This.ListTitleResolved = False
   Set This.Authenticator = Authenticator
   This.FieldsCount = 0
-  Erase This.Fields
+  Erase This.fields
+  Set This.UserIdCache = NewDictionary(vbTextCompare)
+
+  This.FormDigestValue = vbNullString
+  This.FormDigestExpiresAt = 0
+  This.ListItemEntityType = vbNullString
+
+  If AutoDiscoverFields Then
+    On Error Resume Next
+    Call TryAutoDiscoverFields
+    On Error GoTo 0
+  End If
+End Sub
+
+'Initialize list state from an absolute site URL and list display title.
+'@protected
+'@param SiteUrl - Absolute SharePoint site URL.
+'@param ListTitle - List display title used by `GetByTitle`.
+'@param Authenticator - Authenticator used by outgoing HTTP requests.
+'@param AutoDiscoverFields - If true, attempts to infer fields from SharePoint metadata.
+Public Sub protInitFromTitle( _
+  ByVal SiteURL As String, _
+  ByVal ListTitle As String, _
+  ByVal Authenticator As stdICallable, _
+  Optional ByVal AutoDiscoverFields As Boolean = False _
+)
+  Dim cleanedSite As String
+  Dim cleanedTitle As String
+
+  cleanedSite = TrimTrailingSlash(Trim$(SiteURL))
+  cleanedTitle = Trim$(ListTitle)
+
+  If LenB(cleanedSite) = 0 Then
+    Err.Raise 5, "stdSharepointList::protInitFromTitle", "SiteUrl cannot be blank."
+  End If
+  If LenB(cleanedTitle) = 0 Then
+    Err.Raise 5, "stdSharepointList::protInitFromTitle", "ListTitle cannot be blank."
+  End If
+  If Authenticator Is Nothing Then
+    Err.Raise 5, "stdSharepointList::protInitFromTitle", "Authenticator cannot be Nothing."
+  End If
+
+  This.SiteURL = cleanedSite
+  This.ListTitle = cleanedTitle
+  This.listRelativePath = vbNullString
+  This.ListTitleResolved = True
+  Set This.Authenticator = Authenticator
+  This.FieldsCount = 0
+  Erase This.fields
   Set This.UserIdCache = NewDictionary(vbTextCompare)
 
   This.FormDigestValue = vbNullString
@@ -163,7 +230,7 @@ End Sub
 '@returns - The same instance for chaining.
 Public Function FieldsClear() As stdSharepointList
   This.FieldsCount = 0
-  Erase This.Fields
+  Erase This.fields
   Set FieldsClear = Me
 End Function
 
@@ -199,23 +266,108 @@ Public Function FieldsAdd( _
   idx = FieldIndexByInternal(key)
   If idx = 0 Then
     This.FieldsCount = This.FieldsCount + 1
-    ReDim Preserve This.Fields(1 To This.FieldsCount)
+    ReDim Preserve This.fields(1 To This.FieldsCount)
     idx = This.FieldsCount
   End If
-  This.Fields(idx) = fieldDef
+  This.fields(idx) = fieldDef
 
   Set FieldsAdd = Me
+End Function
+
+'Fetch list field metadata from SharePoint for validation and mapping.
+'@returns as stdJSON<Array<{Title:string, InternalName:string, TypeAsString:string, Required:boolean, ReadOnlyField:boolean, Hidden:boolean, MaxLength:Variant, Choices:stdJSON[], AllowMultipleValues:boolean}>> - Field schema rows.
+Public Function FieldsFetchSchema() As stdJSON
+  Dim api As String
+  Dim json As stdJSON
+  Dim d As stdJSON
+  Dim rows As stdJSON
+  Dim outArr As stdJSON
+  Dim i As Long
+  Dim row As stdJSON
+  Dim one As stdJSON
+  Dim choices As stdJSON
+  Dim choiceResults As stdJSON
+  Dim j As Long
+
+  api = ListEndpoint( _
+    "/fields?$select=Title,InternalName,TypeAsString,Required,ReadOnlyField,Hidden,MaxLength,Choices,AllowMultipleValues" _
+  )
+  Set json = RequestJson(api, "GET")
+  Set d = JsonGetObject(json, "d")
+  Set outArr = stdJSON.Create(eJSONArray)
+
+  If d Is Nothing Then
+    Set FieldsFetchSchema = outArr
+    Exit Function
+  End If
+  If Not d.Exists("results") Then
+    Set FieldsFetchSchema = outArr
+    Exit Function
+  End If
+  If Not IsObject(d("results")) Then
+    Set FieldsFetchSchema = outArr
+    Exit Function
+  End If
+  If Not TypeOf d("results") Is stdJSON Then
+    Set FieldsFetchSchema = outArr
+    Exit Function
+  End If
+
+  Set rows = d("results")
+  For i = 1 To rows.Length
+    If Not IsObject(rows(i)) Then GoTo ContinueSchemaRow
+    If Not TypeOf rows(i) Is stdJSON Then GoTo ContinueSchemaRow
+    Set row = rows(i)
+    If Not row.Exists("InternalName") Then GoTo ContinueSchemaRow
+
+    Set one = stdJSON.Create(eJSONObject)
+    one.Add "Title", JsonGetString(row, "Title")
+    one.Add "InternalName", CStr(row("InternalName"))
+    one.Add "TypeAsString", JsonGetString(row, "TypeAsString")
+    one.Add "Required", JsonGetBoolean(row, "Required")
+    one.Add "ReadOnlyField", JsonGetBoolean(row, "ReadOnlyField")
+    one.Add "Hidden", JsonGetBoolean(row, "Hidden")
+    If row.Exists("MaxLength") And Not IsNull(row("MaxLength")) And IsNumeric(row("MaxLength")) Then
+      one.Add "MaxLength", CLng(row("MaxLength"))
+    Else
+      one.Add "MaxLength", Null
+    End If
+    one.Add "AllowMultipleValues", JsonGetBoolean(row, "AllowMultipleValues")
+
+    Set choices = stdJSON.Create(eJSONArray)
+    If row.Exists("Choices") Then
+      If IsObject(row("Choices")) And TypeOf row("Choices") Is stdJSON Then
+        If row("Choices").JsonType = eJSONObject And row("Choices").Exists("results") Then
+          If IsObject(row("Choices")("results")) And TypeOf row("Choices")("results") Is stdJSON Then
+            Set choiceResults = row("Choices")("results")
+            For j = 1 To choiceResults.Length
+              choices.Add CStr(choiceResults(j))
+            Next
+          End If
+        ElseIf row("Choices").JsonType = eJSONArray Then
+          For j = 1 To row("Choices").Length
+            choices.Add CStr(row("Choices")(j))
+          Next
+        End If
+      End If
+    End If
+    one.Add "Choices", choices
+    outArr.Add one
+ContinueSchemaRow:
+  Next
+
+  Set FieldsFetchSchema = outArr
 End Function
 
 'Create an equality OData filter object.
 '@param FieldName - Field/internal name.
 '@param Value - Value to compare.
 '@returns as stdJSON<{field: string, operator: "eq", value: Variant}> - OData filter object.
-Public Function ODataFilterEq(ByVal FieldName As String, ByVal Value As Variant) As stdJSON
+Public Function ODataFilterEq(ByVal fieldName As String, ByVal value As Variant) As stdJSON
   Set ODataFilterEq = stdJSON.Create(eJSONObject)
-  Call ODataFilterEq.Add("field", FieldName)
+  Call ODataFilterEq.Add("field", fieldName)
   Call ODataFilterEq.Add("operator", "eq")
-  Call ODataFilterEq.Add("value", Value)
+  Call ODataFilterEq.Add("value", value)
 End Function
 
 'Combine filters using logical AND.
@@ -256,9 +408,9 @@ End Function
 '@param FieldName - Field/internal name.
 '@param Desc - If true, direction is `desc`; otherwise `asc`.
 '@returns as stdJSON<{name: string, direction: "asc"|"desc"}> - Order-by descriptor.
-Public Function ODataOrderBy(ByVal FieldName As String, Optional ByVal Desc As Boolean = False) As stdJSON
+Public Function ODataOrderBy(ByVal fieldName As String, Optional ByVal Desc As Boolean = False) As stdJSON
   Set ODataOrderBy = stdJSON.Create(eJSONObject)
-  Call ODataOrderBy.Add("name", FieldName)
+  Call ODataOrderBy.Add("name", fieldName)
   Call ODataOrderBy.Add("direction", IIf(Desc, "desc", "asc"))
 End Function
 
@@ -266,12 +418,12 @@ End Function
 '@param ItemId - SharePoint item id.
 '@param Query as Variant<String|stdJSON> - Optional OData query (raw or structured).
 '@returns as stdJSON - Item data transformed to client shape.
-Public Function ItemGet(ByVal ItemId As Variant, Optional ByVal Query As Variant) As stdJSON
+Public Function ItemGet(ByVal itemId As Variant, Optional ByVal query As Variant) As stdJSON
   Dim api As String
   Dim data As stdJSON
   Dim d As stdJSON
 
-  api = ListItemsEndpoint("(" & CStr(ItemId) & ")" & ODataQueryToString(Query))
+  api = ListItemsEndpoint("(" & CStr(itemId) & ")" & ODataQueryToString(query))
   Set data = RequestJson(api, "GET")
   Set d = JsonGetObject(data, "d")
   Set ItemGet = TransformGetterItem(d)
@@ -279,11 +431,11 @@ End Function
 
 'Get list items, following SharePoint pagination via `__next`.
 '@param Query as Variant<String|stdJSON> - Optional OData query (raw or structured).
-'@remark If you have not indexed your columns, and the list has more than 5000 items, 
-'you will need to use `ItemsInplaceQuery` instead. Otherwise you will run into the 
+'@remark If you have not indexed your columns, and the list has more than 5000 items,
+'you will need to use `ItemsInplaceQuery` instead. Otherwise you will run into the
 '"The attempted operation is prohibited because it exceeds the list view threshold." error
 '@returns as stdJSON<Array> - Array of transformed list items.
-Public Function ItemsGet(Optional ByVal Query As Variant) As stdJSON
+Public Function ItemsGet(Optional ByVal query As Variant) As stdJSON
   Dim outArr As stdJSON
   Dim nextUrl As String
   Dim pageJson As stdJSON
@@ -292,7 +444,7 @@ Public Function ItemsGet(Optional ByVal Query As Variant) As stdJSON
   Dim i As Long
 
   Set outArr = stdJSON.Create(eJSONArray)
-  nextUrl = ListItemsEndpoint(ODataQueryToString(Query))
+  nextUrl = ListItemsEndpoint(ODataQueryToString(query))
 
   Do While LenB(nextUrl) > 0
     Set pageJson = RequestJson(nextUrl, "GET")
@@ -340,22 +492,22 @@ End Function
 '@param Data as stdJSON<Object> - Client payload object.
 '@param ItemType - Optional list item entity type.
 '@returns - Newly created SharePoint item id.
-Public Function ItemAdd(ByVal Data As stdJSON, Optional ByVal ItemType As String = vbNullString) As Long
+Public Function ItemAdd(ByVal data As stdJSON, Optional ByVal itemType As String = vbNullString) As Long
   Dim postData As stdJSON
-  Dim response As stdJSON
+  Dim Response As stdJSON
   Dim d As stdJSON
   Dim headers As Variant
 
-  If Data Is Nothing Then Err.Raise 5, "stdSharepointList::ItemAdd", "Data cannot be Nothing."
+  If data Is Nothing Then Err.Raise 5, "stdSharepointList::ItemAdd", "Data cannot be Nothing."
 
-  Set postData = TransformSetterData(Data)
-  If LenB(ItemType) = 0 Then ItemType = GetListItemEntityType()
-  SetMetadataType postData, ItemType
+  Set postData = TransformSetterData(data)
+  If LenB(itemType) = 0 Then itemType = GetListItemEntityType()
+  SetMetadataType postData, itemType
 
   headers = BuildDefaultHeaders(True, SP_JSON_VERBOSE)
   stdHTTP.SetHeader headers, "X-RequestDigest", GetFormDigest()
-  Set response = RequestJson(ListItemsEndpoint(vbNullString), "POST", postData.ToString(), headers, SP_JSON_VERBOSE)
-  Set d = JsonGetObject(response, "d")
+  Set Response = RequestJson(ListItemsEndpoint(vbNullString), "POST", postData.ToString(), headers, SP_JSON_VERBOSE)
+  Set d = JsonGetObject(Response, "d")
   If d Is Nothing Or Not d.Exists("Id") Then
     Err.Raise 5, "stdSharepointList::ItemAdd", "SharePoint did not return created item id."
   End If
@@ -366,23 +518,23 @@ End Function
 '@param ItemId - SharePoint item id.
 '@param Data as stdJSON<Object> - Partial item payload.
 '@returns as stdJSON - Response summary (`status`, `statusText`, optional `data`).
-Public Function ItemSet(ByVal ItemId As Variant, ByVal Data As stdJSON) As stdJSON
-  Dim patchData As stdJSON
+Public Function ItemSet(ByVal itemId As Variant, ByVal data As stdJSON) As stdJSON
+  Dim PatchData As stdJSON
   Dim headers As Variant
   Dim req As stdHTTP
   Dim out As stdJSON
 
-  If Data Is Nothing Then Err.Raise 5, "stdSharepointList::ItemSet", "Data cannot be Nothing."
+  If data Is Nothing Then Err.Raise 5, "stdSharepointList::ItemSet", "Data cannot be Nothing."
 
-  Set patchData = TransformSetterData(Data)
-  SetMetadataType patchData, GetListItemEntityType()
+  Set PatchData = TransformSetterData(data)
+  SetMetadataType PatchData, GetListItemEntityType()
 
   headers = BuildDefaultHeaders(True, SP_JSON_VERBOSE)
   stdHTTP.SetHeader headers, "X-RequestDigest", GetFormDigest()
   stdHTTP.SetHeader headers, "IF-MATCH", "*"
   stdHTTP.SetHeader headers, "X-HTTP-Method", "MERGE"
 
-  Set req = SendRequest(ListItemsEndpoint("(" & CStr(ItemId) & ")"), "POST", patchData.ToString(), headers, SP_JSON_VERBOSE)
+  Set req = SendRequest(ListItemsEndpoint("(" & CStr(itemId) & ")"), "POST", PatchData.ToString(), headers, SP_JSON_VERBOSE)
   Set out = stdJSON.Create(eJSONObject)
   out.Add "status", req.ResponseStatus
   out.Add "statusText", req.ResponseStatusText
@@ -402,7 +554,7 @@ Public Function GetCurrentUserEmail() As String
   Dim loginName As String
   Dim claimSepPos As Long
 
-  Set json = RequestJson(This.SiteUrl & "/_api/web/currentuser?$select=Email,EMail,LoginName", "GET")
+  Set json = RequestJson(This.SiteURL & "/_api/web/currentuser?$select=Email,EMail,LoginName", "GET")
   Set d = JsonGetObject(json, "d")
   If d Is Nothing Then
     Err.Raise 5, "stdSharepointList::GetCurrentUserEmail", "SharePoint currentuser response did not contain 'd'."
@@ -446,7 +598,7 @@ Public Function GetOrCreateUserId(ByVal UserText As String) As Long
   body = "{""logonName"":" & JsonStringLiteral(UserText) & "}"
   headers = BuildDefaultHeaders(True, SP_JSON_VERBOSE)
   stdHTTP.SetHeader headers, "X-RequestDigest", GetFormDigest()
-  Set json = RequestJson(This.SiteUrl & "/_api/web/ensureuser", "POST", body, headers, SP_JSON_VERBOSE)
+  Set json = RequestJson(This.SiteURL & "/_api/web/ensureuser", "POST", body, headers, SP_JSON_VERBOSE)
   Set d = JsonGetObject(json, "d")
   If d Is Nothing Or Not d.Exists("Id") Then
     Err.Raise 5, "stdSharepointList::GetOrCreateUserId", "SharePoint ensureuser did not return Id."
@@ -467,7 +619,7 @@ Public Function SearchUsersByName(ByVal query As String, Optional ByVal maxResul
   Dim queryParams As stdJSON
   Dim meta As stdJSON
   Dim headers As Variant
-  Dim response As stdJSON
+  Dim Response As stdJSON
   Dim rawResults As String
   Dim rows As stdJSON
   Dim outArr As stdJSON
@@ -500,8 +652,8 @@ Public Function SearchUsersByName(ByVal query As String, Optional ByVal maxResul
 
   headers = BuildDefaultHeaders(True, SP_JSON_VERBOSE)
   stdHTTP.SetHeader headers, "X-RequestDigest", GetFormDigest()
-  Set response = RequestJson( _
-    This.SiteUrl & "/_api/SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface.clientPeoplePickerSearchUser", _
+  Set Response = RequestJson( _
+    This.SiteURL & "/_api/SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface.clientPeoplePickerSearchUser", _
     "POST", _
     payload.ToString(), _
     headers, _
@@ -509,7 +661,7 @@ Public Function SearchUsersByName(ByVal query As String, Optional ByVal maxResul
   )
 
   Set outArr = stdJSON.Create(eJSONArray)
-  rawResults = ExtractPeoplePickerResultJson(response)
+  rawResults = ExtractPeoplePickerResultJson(Response)
   If LenB(rawResults) = 0 Then
     Set SearchUsersByName = outArr
     Exit Function
@@ -561,7 +713,7 @@ Public Function BatchItemsSet( _
   Dim headers As Variant
   Dim req As stdHTTP
   Dim itemType As String
-  Dim item As stdJSON
+  Dim Item As stdJSON
   Dim op As stdJSON
   Dim j As Long
   Dim one As Object
@@ -579,7 +731,7 @@ Public Function BatchItemsSet( _
   itemType = GetListItemEntityType()
 
   Set chunked = SplitJsonArrayIntoChunks(BatchChanges, BATCH_CHUNK_SIZE)
-  For i = 1 To chunked.Count
+  For i = 1 To chunked.count
     Set chunk = chunked(i)
     If chunk.Length > 0 Then chunk.Add chunk(1) 'SP workaround parity with TypeScript implementation
 
@@ -589,15 +741,15 @@ Public Function BatchItemsSet( _
     lineItems.Add vbNullString
 
     For j = 1 To chunk.Length
-      Set item = chunk(j)
-      Set op = TransformSetterData(JsonGetObject(item, "data"))
+      Set Item = chunk(j)
+      Set op = TransformSetterData(JsonGetObject(Item, "data"))
       SetMetadataType op, itemType
 
       lineItems.Add "--changeset_" & ChangeSetId
       lineItems.Add "Content-Type: application/http"
       lineItems.Add "Content-Transfer-Encoding: binary"
       lineItems.Add vbNullString
-      lineItems.Add "PATCH " & ListItemsEndpoint("(" & CStr(item("id")) & ")") & " HTTP/1.1"
+      lineItems.Add "PATCH " & ListItemsEndpoint("(" & CStr(Item("id")) & ")") & " HTTP/1.1"
       lineItems.Add "Content-Type: " & SP_JSON_VERBOSE
       lineItems.Add "Accept: " & SP_JSON_LIGHT
       lineItems.Add "If-Match: *"
@@ -612,14 +764,14 @@ Public Function BatchItemsSet( _
 
     headers = BuildDefaultHeaders(True, "multipart/mixed; boundary=""batch_" & BatchUuid & """")
     stdHTTP.SetHeader headers, "X-RequestDigest", digest
-    Set req = SendRequest(This.SiteUrl & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
+    Set req = SendRequest(This.SiteURL & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
 
     Set parseRows = ParseODataBatchResponse(CStr(req.ResponseText))
-    For j = 1 To parseRows.Count - 1
+    For j = 1 To parseRows.count - 1
       Set one = parseRows(j)
       Set out = stdJSON.Create(eJSONObject)
       out.Add "type", "update"
-      out.Add "id", chunk(j)("id")
+      out.Add "id", CLng(chunk(j)("id"))
       out.Add "httpStatus", one("statusCode")
       If IsObject(one("json")) Then out.Add "data", one("json")
       out.Add "payload", chunk(j)
@@ -662,7 +814,7 @@ Public Function BatchItemsCreate(ByVal BatchItems As stdJSON, Optional ByVal Bat
   itemType = GetListItemEntityType()
 
   Set chunked = SplitJsonArrayIntoChunks(BatchItems, BATCH_CHUNK_SIZE)
-  For i = 1 To chunked.Count
+  For i = 1 To chunked.count
     Set chunk = chunked(i)
 
     Set lineItems = New Collection
@@ -691,10 +843,10 @@ Public Function BatchItemsCreate(ByVal BatchItems As stdJSON, Optional ByVal Bat
 
     headers = BuildDefaultHeaders(True, "multipart/mixed; boundary=""batch_" & BatchUuid & """")
     stdHTTP.SetHeader headers, "X-RequestDigest", digest
-    Set req = SendRequest(This.SiteUrl & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
+    Set req = SendRequest(This.SiteURL & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
 
     Set parseRows = ParseODataBatchResponse(CStr(req.ResponseText))
-    For j = 1 To parseRows.Count
+    For j = 1 To parseRows.count - 1
       Set one = parseRows(j)
       Set out = stdJSON.Create(eJSONObject)
       out.Add "type", "create"
@@ -702,7 +854,7 @@ Public Function BatchItemsCreate(ByVal BatchItems As stdJSON, Optional ByVal Bat
       If IsObject(one("json")) Then
         out.Add "data", one("json")
         Set d = JsonGetObject(one("json"), "d")
-        If Not d Is Nothing And d.Exists("Id") Then out.Add "id", CLng(d("Id"))
+        If Not d Is Nothing Then If d.Exists("Id") Then out.Add "id", CLng(d("Id"))
       End If
       out.Add "payload", chunk(j)
       results.Add out
@@ -746,7 +898,7 @@ Public Function BatchItemsDelete( _
   digest = GetFormDigest()
 
   Set chunked = SplitJsonArrayIntoChunks(ItemIds, BATCH_CHUNK_SIZE)
-  For i = 1 To chunked.Count
+  For i = 1 To chunked.count
     Set chunk = chunked(i)
 
     Set lineItems = New Collection
@@ -770,10 +922,10 @@ Public Function BatchItemsDelete( _
 
     headers = BuildDefaultHeaders(True, "multipart/mixed; boundary=""batch_" & BatchUuid & """")
     stdHTTP.SetHeader headers, "X-RequestDigest", digest
-    Set req = SendRequest(This.SiteUrl & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
+    Set req = SendRequest(This.SiteURL & "/_api/$batch", "POST", JoinCollection(lineItems, vbCrLf), headers, "multipart/mixed")
 
     Set parseRows = ParseODataBatchResponse(CStr(req.ResponseText))
-    For j = 1 To parseRows.Count
+    For j = 1 To parseRows.count
       Set one = parseRows(j)
       Set out = stdJSON.Create(eJSONObject)
       out.Add "type", "delete"
@@ -791,7 +943,7 @@ End Function
 '@param Payload as stdJSON - Commit payload (`create`/`update`/`delete`).
 '@returns - Simplified payload, or `Nothing` when an update has no effective field changes.
 '@remark For updates, pass `previousData` on the payload object to enable simplification.
-Public Function SimplifyPayload(ByVal Payload As stdJSON) As stdJSON
+Public Function SimplifyPayload(ByVal payload As stdJSON) As stdJSON
   Dim pType As String
   Dim dataObj As stdJSON
   Dim prevObj As stdJSON
@@ -805,29 +957,29 @@ Public Function SimplifyPayload(ByVal Payload As stdJSON) As stdJSON
   Dim out As stdJSON
   Dim payloadObj As stdJSON
 
-  If Payload Is Nothing Then Exit Function
-  If Not Payload.Exists("type") Then
-    Set SimplifyPayload = JsonClone(Payload)
+  If payload Is Nothing Then Exit Function
+  If Not payload.Exists("type") Then
+    Set SimplifyPayload = JsonClone(payload)
     Exit Function
   End If
 
-  pType = LCase$(CStr(Payload("type")))
+  pType = LCase$(CStr(payload("type")))
   If pType <> "update" Then
-    Set SimplifyPayload = JsonClone(Payload)
+    Set SimplifyPayload = JsonClone(payload)
     Exit Function
   End If
 
-  Set payloadObj = JsonGetObject(Payload, "payload")
+  Set payloadObj = JsonGetObject(payload, "payload")
   Set dataObj = JsonGetObject(payloadObj, "data")
-  Set prevObj = JsonGetObject(Payload, "previousData")
+  Set prevObj = JsonGetObject(payload, "previousData")
   If dataObj Is Nothing Or prevObj Is Nothing Then
-    Set SimplifyPayload = JsonClone(Payload)
+    Set SimplifyPayload = JsonClone(payload)
     Exit Function
   End If
 
   Set changed = stdJSON.Create(eJSONObject)
   Set info = dataObj.ChildrenInfo
-  For i = 1 To info.Count
+  For i = 1 To info.count
     Set node = info(i)
     key = CStr(node("key"))
     curVal = node("value")
@@ -845,7 +997,7 @@ Public Function SimplifyPayload(ByVal Payload As stdJSON) As stdJSON
   Set out = stdJSON.Create(eJSONObject)
   out.Add "type", "update"
   Set payloadObj = stdJSON.Create(eJSONObject)
-  payloadObj.Add "id", Payload("payload")("id")
+  payloadObj.Add "id", payload("payload")("id")
   payloadObj.Add "data", changed
   out.Add "payload", payloadObj
 
@@ -855,7 +1007,7 @@ End Function
 'Process a set of commit payloads through batch methods.
 '@param Payloads as stdJSON<Array> - Commit payloads with `type` + `payload`.
 '@returns as stdJSON<{update: stdJSON[], create: stdJSON[], delete: stdJSON[]}> - Batch operation results.
-Public Function ProcessCommitPayloads(ByVal Payloads As stdJSON) As stdJSON
+Public Function ProcessCommitPayloads(ByVal payloads As stdJSON) As stdJSON
   Dim updates As stdJSON
   Dim creates As stdJSON
   Dim deletes As stdJSON
@@ -872,9 +1024,9 @@ Public Function ProcessCommitPayloads(ByVal Payloads As stdJSON) As stdJSON
   Set creates = stdJSON.Create(eJSONArray)
   Set deletes = stdJSON.Create(eJSONArray)
 
-  If Not Payloads Is Nothing Then
-    For i = 1 To Payloads.Length
-      Set payload = Payloads(i)
+  If Not payloads Is Nothing Then
+    For i = 1 To payloads.Length
+      Set payload = payloads(i)
       If payload Is Nothing Then GoTo ContinueLoop
       If Not payload.Exists("type") Then GoTo ContinueLoop
 
@@ -934,7 +1086,7 @@ End Function
  'Build the base list REST endpoint using list title and suffix.
 Private Function ListEndpoint(ByVal suffix As String) As String
   EnsureListDisplayTitle
-  ListEndpoint = This.SiteUrl & "/_api/web/lists/GetByTitle('" & EscapeODataLiteral(This.ListTitle) & "')" & suffix
+  ListEndpoint = This.SiteURL & "/_api/web/lists/GetByTitle('" & EscapeODataLiteral(This.ListTitle) & "')" & suffix
 End Function
 
  'Send an HTTP request and parse JSON response (empty body -> empty object).
@@ -974,7 +1126,7 @@ Private Function SendRequest( _
   headers = BuildDefaultHeaders(True, contentType)
   MergeHeaderArray headers, extraHeaders
 
-  options = stdHTTP.CreateOptions(body, headers, timeoutMS:=TIMEOUT_MAX_MS )
+  options = stdHTTP.CreateOptions(body, headers, timeoutMs:=TIMEOUT_MAX_MS)
 
   Set req = stdHTTP.Create(url, method, HTTPSync, options, This.Authenticator)
   EnsureSuccess req, "stdSharepointList::SendRequest"
@@ -1013,7 +1165,7 @@ Private Sub EnsureSuccess(ByVal req As stdHTTP, ByVal sourceName As String)
 End Sub
 
  'Convert structured/raw OData query input into a querystring.
-Private Function ODataQueryToString(Optional ByVal Query As Variant) As String
+Private Function ODataQueryToString(Optional ByVal query As Variant) As String
   Dim params As Collection
   Dim q As stdJSON
   Dim selectCsv As String
@@ -1024,15 +1176,15 @@ Private Function ODataQueryToString(Optional ByVal Query As Variant) As String
   Set params = New Collection
   useDefaultExpand = True
 
-  If IsMissingOrEmpty(Query) Then
+  If IsMissingOrEmpty(query) Then
     BuildDefaultSelectExpand selectCsv, expandCsv
     If LenB(selectCsv) > 0 Then params.Add "$select=" & selectCsv
     If LenB(expandCsv) > 0 Then params.Add "$expand=" & expandCsv
-  ElseIf VarType(Query) = vbString Then
-    ODataQueryToString = NormalizeRawQuery(CStr(Query))
+  ElseIf VarType(query) = vbString Then
+    ODataQueryToString = NormalizeRawQuery(CStr(query))
     Exit Function
-  ElseIf IsObject(Query) And TypeOf Query Is stdJSON Then
-    Set q = Query
+  ElseIf IsObject(query) And TypeOf query Is stdJSON Then
+    Set q = query
     If q.Exists("$select") Then
       If IsObject(q("$select")) And TypeOf q("$select") Is stdJSON Then
         selectCsv = EncodeArrayCsv(q("$select"))
@@ -1156,24 +1308,24 @@ Private Function ODataValueToString(ByVal value As Variant) As String
 End Function
 
  'Normalize SharePoint getter payload values into client-facing shape.
-Private Function TransformGetterItem(ByVal item As stdJSON) As stdJSON
+Private Function TransformGetterItem(ByVal Item As stdJSON) As stdJSON
   Dim out As stdJSON
   Dim idx As Long
   Dim def As TFieldDef
   Dim fieldName As String
-  Dim fieldType As Long
+  Dim FieldType As Long
   Dim rawValue As Variant
 
-  Set out = JsonClone(item)
+  Set out = JsonClone(Item)
 
   For idx = 1 To This.FieldsCount
-    def = This.Fields(idx)
+    def = This.fields(idx)
     fieldName = def.InternalName
-    fieldType = CLng(def.FieldType)
+    FieldType = CLng(def.FieldType)
     If Not out.Exists(fieldName) Then GoTo ContinueField
 
     rawValue = out(fieldName)
-    Select Case fieldType
+    Select Case FieldType
       Case SharePointFieldMultiChoice
         If IsObject(rawValue) Then
           If TypeOf rawValue Is stdJSON Then
@@ -1221,7 +1373,7 @@ Private Function TransformSetterData(ByVal data As stdJSON) As stdJSON
   Set out = stdJSON.Create(eJSONObject)
   Set info = data.ChildrenInfo()
 
-  For i = 1 To info.Count
+  For i = 1 To info.count
     Set node = info(i)
     key = CStr(node("key"))
     lowerKey = LCase$(key)
@@ -1234,7 +1386,18 @@ Private Function TransformSetterData(ByVal data As stdJSON) As stdJSON
       expandedProp = LCase$(Mid$(key, slashPos + 1))
       fieldIdx = FieldIndexByInternal(baseField)
       If fieldIdx > 0 Then
-        def = This.Fields(fieldIdx)
+        def = This.fields(fieldIdx)
+        If IsClearValue(val) Then
+          If expandedProp = "email" Or expandedProp = "id" Then
+            If CLng(def.FieldType) = SharePointFieldPerson Or CLng(def.FieldType) = SharePointFieldLookup Then
+              JsonAddOrSet out, baseField & "Id", Null
+              GoTo ContinueNode
+            ElseIf CLng(def.FieldType) = SharePointFieldMultiPerson Then
+              JsonAddOrSet out, baseField & "Id", BuildIdResultsObject(Null)
+              GoTo ContinueNode
+            End If
+          End If
+        End If
         If expandedProp = "email" Then
           If CLng(def.FieldType) = SharePointFieldPerson Then
             JsonAddOrSet out, baseField & "Id", ResolvePrincipalToUserId(val)
@@ -1260,32 +1423,56 @@ Private Function TransformSetterData(ByVal data As stdJSON) As stdJSON
 
     fieldIdx = FieldIndexByInternal(lowerKey)
     If fieldIdx > 0 Then
-      def = This.Fields(fieldIdx)
-      Select Case CLng(def.FieldType)
-        Case SharePointFieldPerson
-          JsonAddOrSet out, key & "Id", ResolvePrincipalToUserId(val)
-        Case SharePointFieldMultiPerson
-          JsonAddOrSet out, key & "Id", BuildIdResultsObject(val)
-        Case SharePointFieldMultiChoice
-          JsonAddOrSet out, key, BuildStringResultsObject(val)
-        Case SharePointFieldLookup
-          JsonAddOrSet out, key & "Id", NormalizeLookupId(val)
-        Case SharePointFieldDate
-          If IsNull(val) Then
+      def = This.fields(fieldIdx)
+      If IsClearValue(val) Then
+        Select Case CLng(def.FieldType)
+          Case SharePointFieldPerson, SharePointFieldLookup
+            JsonAddOrSet out, key & "Id", Null
+          Case SharePointFieldMultiPerson
+            JsonAddOrSet out, key & "Id", BuildIdResultsObject(Null)
+          Case SharePointFieldMultiChoice
+            JsonAddOrSet out, key, BuildStringResultsObject(Null)
+          Case Else
             JsonAddOrSet out, key, Null
-          Else
+        End Select
+      Else
+        Select Case CLng(def.FieldType)
+          Case SharePointFieldPerson
+            JsonAddOrSet out, key & "Id", ResolvePrincipalToUserId(val)
+          Case SharePointFieldMultiPerson
+            JsonAddOrSet out, key & "Id", BuildIdResultsObject(val)
+          Case SharePointFieldMultiChoice
+            JsonAddOrSet out, key, BuildStringResultsObject(val)
+          Case SharePointFieldLookup
+            JsonAddOrSet out, key & "Id", NormalizeLookupId(val)
+          Case SharePointFieldDate
             JsonAddOrSet out, key, FormatDateForSharePoint(val)
-          End If
-        Case Else
-          JsonAddOrSet out, key, val
-      End Select
+          Case Else
+            JsonAddOrSet out, key, val
+        End Select
+      End If
     Else
-      JsonAddOrSet out, key, val
+      If IsClearValue(val) Then
+        JsonAddOrSet out, key, Null
+      Else
+        JsonAddOrSet out, key, val
+      End If
     End If
 ContinueNode:
   Next
 
   Set TransformSetterData = out
+End Function
+
+'True when a setter value should clear the SharePoint field.
+Private Function IsClearValue(ByVal value As Variant) As Boolean
+  If IsNull(value) Then
+    IsClearValue = True
+  ElseIf IsEmpty(value) Then
+    IsClearValue = True
+  ElseIf VarType(value) = vbString Then
+    IsClearValue = (LenB(Trim$(CStr(value))) = 0)
+  End If
 End Function
 
  'Get and cache SharePoint form digest for write/batch requests.
@@ -1302,7 +1489,7 @@ Private Function GetFormDigest() As String
     Exit Function
   End If
 
-  Set json = RequestJson(This.SiteUrl & "/_api/contextinfo", "POST", vbNullString, Empty, SP_JSON_VERBOSE)
+  Set json = RequestJson(This.SiteURL & "/_api/contextinfo", "POST", vbNullString, Empty, SP_JSON_VERBOSE)
   Set d = JsonGetObject(json, "d")
   Set info = JsonGetObject(d, "GetContextWebInformation")
   This.FormDigestValue = CStr(info("FormDigestValue"))
@@ -1351,7 +1538,7 @@ Private Function ParseODataBatchResponse(ByVal body As String) As Collection
   Dim re As Object
   Dim row As Object
   Dim statusCode As Long
-  Dim statusText As String
+  Dim StatusText As String
 
   Set ParseODataBatchResponse = New Collection
   boundary = ExtractBatchBoundary(body)
@@ -1359,7 +1546,7 @@ Private Function ParseODataBatchResponse(ByVal body As String) As Collection
 
   parts = Split(body, boundary)
   Set re = CreateObject("VBScript.RegExp")
-  re.Pattern = "HTTP/\d\.\d\s+(\d+)\s+([^\r\n]+)"
+  re.pattern = "HTTP/\d\.\d\s+(\d+)\s+([^\r\n]+)"
   re.Global = False
   re.IgnoreCase = True
 
@@ -1371,16 +1558,16 @@ Private Function ParseODataBatchResponse(ByVal body As String) As Collection
     If re.Test(part) Then
       Set matches = re.Execute(part)
       statusCode = CLng(matches(0).SubMatches(0))
-      statusText = CStr(matches(0).SubMatches(1))
+      StatusText = CStr(matches(0).SubMatches(1))
     Else
       statusCode = 0
-      statusText = vbNullString
+      StatusText = vbNullString
     End If
 
     Set row = NewDictionary(vbTextCompare)
     row("statusCode") = statusCode
-    row("statusText") = statusText
-    set row("json") = TryExtractJsonObject(part)
+    row("statusText") = StatusText
+    Set row("json") = TryExtractJsonObject(part)
     ParseODataBatchResponse.Add row
 ContinuePart:
   Next
@@ -1408,12 +1595,12 @@ Private Function ExtractBatchBoundary(ByVal body As String) As String
   Dim m As Object
 
   Set re = CreateObject("VBScript.RegExp")
-  re.Pattern = "--batchresponse_[\w\-]+"
+  re.pattern = "--batchresponse_[\w\-]+"
   re.Global = False
   re.IgnoreCase = True
   If re.Test(body) Then
     Set m = re.Execute(body)(0)
-    ExtractBatchBoundary = m.Value
+    ExtractBatchBoundary = m.value
   End If
 End Function
 
@@ -1442,10 +1629,10 @@ End Function
 
  'Compare values with field-aware normalization (for simplification).
 Private Function ValuesEqualForField(ByVal key As String, ByVal leftValue As Variant, ByVal rightValue As Variant) As Boolean
-  Dim fieldType As Long
-  fieldType = ResolveFieldTypeByName(key)
+  Dim FieldType As Long
+  FieldType = ResolveFieldTypeByName(key)
 
-  If fieldType = SharePointFieldDate Then
+  If FieldType = SharePointFieldDate Then
     ValuesEqualForField = (NormalizeDateForCompare(leftValue) = NormalizeDateForCompare(rightValue))
   ElseIf IsObject(leftValue) Xor IsObject(rightValue) Then
     ValuesEqualForField = False
@@ -1453,7 +1640,7 @@ Private Function ValuesEqualForField(ByVal key As String, ByVal leftValue As Var
     If TypeOf leftValue Is stdJSON And TypeOf rightValue Is stdJSON Then
       ValuesEqualForField = (leftValue.ToString() = rightValue.ToString())
     Else
-      ValuesEqualForField = (TypeName(leftValue) = TypeName(rightValue))
+      ValuesEqualForField = (typeName(leftValue) = typeName(rightValue))
     End If
   ElseIf IsNull(leftValue) Xor IsNull(rightValue) Then
     ValuesEqualForField = False
@@ -1618,15 +1805,15 @@ End Sub
 
 'Find schema index by internal field name.
 '@returns - 1-based index in `This.Fields`, or 0 when not found.
-Private Function FieldIndexByInternal(ByVal internalName As String) As Long
+Private Function FieldIndexByInternal(ByVal InternalName As String) As Long
   Dim target As String
   Dim i As Long
 
-  target = LCase$(Trim$(internalName))
+  target = LCase$(Trim$(InternalName))
   If LenB(target) = 0 Then Exit Function
 
   For i = 1 To This.FieldsCount
-    If LCase$(This.Fields(i).InternalName) = target Then
+    If LCase$(This.fields(i).InternalName) = target Then
       FieldIndexByInternal = i
       Exit Function
     End If
@@ -1643,7 +1830,7 @@ Private Function ResolveFieldTypeByName(ByVal key As String) As Long
 
   fieldIdx = FieldIndexByInternal(lower)
   If fieldIdx > 0 Then
-    ResolveFieldTypeByName = CLng(This.Fields(fieldIdx).FieldType)
+    ResolveFieldTypeByName = CLng(This.fields(fieldIdx).FieldType)
     Exit Function
   End If
 
@@ -1652,7 +1839,7 @@ Private Function ResolveFieldTypeByName(ByVal key As String) As Long
     candidate = Left$(lower, slashPos - 1)
     fieldIdx = FieldIndexByInternal(candidate)
     If fieldIdx > 0 Then
-      ResolveFieldTypeByName = CLng(This.Fields(fieldIdx).FieldType)
+      ResolveFieldTypeByName = CLng(This.fields(fieldIdx).FieldType)
       Exit Function
     End If
   End If
@@ -1661,7 +1848,7 @@ Private Function ResolveFieldTypeByName(ByVal key As String) As Long
     candidate = Left$(lower, Len(lower) - 2)
     fieldIdx = FieldIndexByInternal(candidate)
     If fieldIdx > 0 Then
-      ResolveFieldTypeByName = CLng(This.Fields(fieldIdx).FieldType)
+      ResolveFieldTypeByName = CLng(This.fields(fieldIdx).FieldType)
       Exit Function
     End If
   End If
@@ -1763,7 +1950,7 @@ Private Sub BuildDefaultSelectExpand(ByRef selectCsv As String, ByRef expandCsv 
   Dim selectParts As Collection
   Dim expandParts As Collection
   Dim fieldDef As TFieldDef
-  Dim internalName As String
+  Dim InternalName As String
   Dim fType As Long
   Dim props As Collection
   Dim i As Long
@@ -1774,36 +1961,36 @@ Private Sub BuildDefaultSelectExpand(ByRef selectCsv As String, ByRef expandCsv 
   AddUnique selectParts, stdHTTP.URIEncode("Id")
 
   For idx = 1 To This.FieldsCount
-    fieldDef = This.Fields(idx)
-    internalName = fieldDef.InternalName
+    fieldDef = This.fields(idx)
+    InternalName = fieldDef.InternalName
     fType = CLng(fieldDef.FieldType)
 
     Select Case fType
       Case SharePointFieldPerson, SharePointFieldMultiPerson
-        AddUnique expandParts, stdHTTP.URIEncode(internalName)
+        AddUnique expandParts, stdHTTP.URIEncode(InternalName)
         Set props = fieldDef.SelectProps
-        If props.Count = 0 Then
-          AddUnique selectParts, stdHTTP.URIEncode(internalName & "/Id")
-          AddUnique selectParts, stdHTTP.URIEncode(internalName & "/Title")
-          AddUnique selectParts, stdHTTP.URIEncode(internalName & "/EMail")
+        If props.count = 0 Then
+          AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/Id")
+          AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/Title")
+          AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/EMail")
         Else
-          For i = 1 To props.Count
-            AddUnique selectParts, stdHTTP.URIEncode(internalName & "/" & CStr(props(i)))
+          For i = 1 To props.count
+            AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/" & CStr(props(i)))
           Next
         End If
       Case SharePointFieldLookup, SharePointFieldFile
-        AddUnique expandParts, stdHTTP.URIEncode(internalName)
+        AddUnique expandParts, stdHTTP.URIEncode(InternalName)
         Set props = fieldDef.SelectProps
-        If props.Count = 0 Then
-          AddUnique selectParts, stdHTTP.URIEncode(internalName & "/Id")
-          AddUnique selectParts, stdHTTP.URIEncode(internalName & "/Title")
+        If props.count = 0 Then
+          AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/Id")
+          AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/Title")
         Else
-          For i = 1 To props.Count
-            AddUnique selectParts, stdHTTP.URIEncode(internalName & "/" & CStr(props(i)))
+          For i = 1 To props.count
+            AddUnique selectParts, stdHTTP.URIEncode(InternalName & "/" & CStr(props(i)))
           Next
         End If
       Case Else
-        AddUnique selectParts, stdHTTP.URIEncode(internalName)
+        AddUnique selectParts, stdHTTP.URIEncode(InternalName)
     End Select
   Next idx
 
@@ -1845,7 +2032,7 @@ End Function
 
  'Join query parameters collection into a `?k=v&...` querystring.
 Private Function JoinParams(ByVal params As Collection) As String
-  If params.Count = 0 Then Exit Function
+  If params.count = 0 Then Exit Function
   JoinParams = "?" & JoinCollection(params, "&")
 End Function
 
@@ -1864,7 +2051,7 @@ End Function
 Private Function JoinCollection(ByVal items As Collection, ByVal delim As String) As String
   Dim i As Long
   Dim sb As String
-  For i = 1 To items.Count
+  For i = 1 To items.count
     If i > 1 Then sb = sb & delim
     sb = sb & CStr(items(i))
   Next
@@ -1874,14 +2061,14 @@ End Function
  'Add a string value to collection only if not already present.
 Private Sub AddUnique(ByVal list As Collection, ByVal value As String)
   Dim i As Long
-  For i = 1 To list.Count
+  For i = 1 To list.count
     If CStr(list(i)) = value Then Exit Sub
   Next
   list.Add value
 End Sub
 
  'Parse list page URL into site URL, list title, and relative path.
-Private Sub ParseListUrl(ByVal raw As String, ByRef siteUrl As String, ByRef listTitle As String, ByRef listRelativePath As String)
+Private Sub ParseListUrl(ByVal raw As String, ByRef SiteURL As String, ByRef ListTitle As String, ByRef listRelativePath As String)
   Dim cleaned As String
   Dim listsPos As Long
   Dim afterLists As String
@@ -1896,7 +2083,7 @@ Private Sub ParseListUrl(ByVal raw As String, ByRef siteUrl As String, ByRef lis
   listsPos = InStr(1, LCase$(cleaned), "/lists/", vbTextCompare)
   If listsPos <= 0 Then Err.Raise 5, "stdSharepointList::ParseListUrl", "ListUrl must contain `/Lists/<ListName>`."
 
-  siteUrl = Left$(cleaned, listsPos - 1)
+  SiteURL = Left$(cleaned, listsPos - 1)
   afterLists = Mid$(cleaned, listsPos + Len("/Lists/"))
   slashPos = InStr(1, afterLists, "/", vbTextCompare)
   If slashPos > 0 Then
@@ -1905,9 +2092,9 @@ Private Sub ParseListUrl(ByVal raw As String, ByRef siteUrl As String, ByRef lis
     listPathSegment = afterLists
   End If
 
-  listTitle = stdHTTP.URIDecode(listPathSegment)
-  siteUrl = TrimTrailingSlash(siteUrl)
-  listRelativePath = BuildServerRelativeListPath(siteUrl, listPathSegment)
+  ListTitle = stdHTTP.URIDecode(listPathSegment)
+  SiteURL = TrimTrailingSlash(SiteURL)
+  listRelativePath = BuildServerRelativeListPath(SiteURL, listPathSegment)
 End Sub
 
 Private Sub EnsureListDisplayTitle()
@@ -1929,7 +2116,7 @@ Private Function ResolveListDisplayTitle() As String
   Dim json As stdJSON
   Dim d As stdJSON
 
-  api = This.SiteUrl & "/_api/web/GetList('" & EscapeODataLiteral(This.ListRelativePath) & "')?$select=Title"
+  api = This.SiteURL & "/_api/web/GetList('" & EscapeODataLiteral(This.listRelativePath) & "')?$select=Title"
   Set json = RequestJson(api, "GET")
   Set d = JsonGetObject(json, "d")
 
@@ -1940,11 +2127,11 @@ Private Function ResolveListDisplayTitle() As String
   ResolveListDisplayTitle = CStr(d("Title"))
 End Function
 
-Private Function BuildServerRelativeListPath(ByVal siteUrl As String, ByVal listPathSegment As String) As String
+Private Function BuildServerRelativeListPath(ByVal SiteURL As String, ByVal listPathSegment As String) As String
   Dim siteRelativePath As String
   Dim decodedSegment As String
 
-  siteRelativePath = SiteServerRelativePath(siteUrl)
+  siteRelativePath = SiteServerRelativePath(SiteURL)
   decodedSegment = stdHTTP.URIDecode(listPathSegment)
 
   If siteRelativePath = "/" Then
@@ -2015,6 +2202,17 @@ Private Function JsonGetString(ByVal parent As stdJSON, ByVal key As String) As 
   JsonGetString = Trim$(CStr(parent(key)))
 End Function
 
+'Get a child value as Boolean, returning False when missing/invalid.
+Private Function JsonGetBoolean(ByVal parent As stdJSON, ByVal key As String) As Boolean
+  If parent Is Nothing Then Exit Function
+  If Not parent.Exists(key) Then Exit Function
+  If IsObject(parent(key)) Then Exit Function
+  If IsNull(parent(key)) Then Exit Function
+  On Error Resume Next
+  JsonGetBoolean = CBool(parent(key))
+  On Error GoTo 0
+End Function
+
 'Convert a named JSON property to Long safely, returning 0 when absent/invalid.
 Private Function VariantToLong(ByVal parent As stdJSON, ByVal key As String) As Long
   If parent Is Nothing Then Exit Function
@@ -2043,11 +2241,11 @@ Private Sub JsonAddOrSet(ByVal parent As stdJSON, ByVal key As String, ByVal v A
 End Sub
 
  'Create a deep JSON clone using `ToVBObject` round-trip.
-Private Function JsonClone(ByVal source As stdJSON) As stdJSON
-  If source Is Nothing Then
+Private Function JsonClone(ByVal Source As stdJSON) As stdJSON
+  If Source Is Nothing Then
     Set JsonClone = stdJSON.Create(eJSONObject)
   Else
-    Set JsonClone = stdJSON.CreateFromVariant(source.ToVBObject())
+    Set JsonClone = stdJSON.CreateFromVariant(Source.ToVBObject())
   End If
 End Function
 
@@ -2085,8 +2283,8 @@ Private Function NormalizeSelectProps(ByVal SelectProps As Variant) As Collectio
       End If
       Set NormalizeSelectProps = out
       Exit Function
-    ElseIf TypeName(SelectProps) = "Collection" Then
-      For i = 1 To SelectProps.Count
+    ElseIf typeName(SelectProps) = "Collection" Then
+      For i = 1 To SelectProps.count
         out.Add CStr(SelectProps(i))
       Next
       Set NormalizeSelectProps = out
@@ -2126,7 +2324,7 @@ End Function
 Private Function NewDictionary(Optional ByVal compareMode As Long = vbBinaryCompare) As Object
   Set NewDictionary = CreateObject("Scripting.Dictionary")
   On Error Resume Next
-  NewDictionary.CompareMode = compareMode
+  NewDictionary.compareMode = compareMode
   On Error GoTo 0
 End Function
 

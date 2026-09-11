@@ -435,10 +435,14 @@ Public Property Get isFinished() As Boolean
     isFinished = This.Response.isComplete
   #Else
     On Error GoTo Skip 'Sometimes `responseBody` and `status` isn't ready yet. So will skip if so
-    If This.HTTP.status = 202 Then 'No content
+    If This.HTTP.status = 204 Then 'No content
       isFinished = True
     Else
-      isFinished = This.HTTP.WaitForResponse(0.001) And This.HTTP.ResponseBody()(0) >= 0
+      Dim testFinished as boolean: testFinished = This.HTTP.WaitForResponse(0.001)
+      if testFinished then
+        Dim bytes: bytes = This.HTTP.ResponseBody()
+        isFinished = bytes(0) >= 0
+      end if
     End If
     Exit Property
 Skip:
@@ -612,11 +616,11 @@ End Property
 '@param ThreadingStyle - The Threading approach. Either HTTPSync (Synchronous) or HTTPAsync (Asynchronous).
 '@param Options as Variant<Array> - Use `stdHTTP.CreateOptions()` to generate these. Array indexed by stdHTTPOptions enum.
 '@param Authenticator as stdICallable<(HTTP: Object, RequestMethod: String, URL: String, ThreadingStyle: Long, options: Variant)=>Void> - A callable object which will be called before the request is sent. This can be used to add authentication headers, etc.
-Friend Sub protInit(ByVal sURL As String, Optional ByVal RequestMethod As String = "GET", Optional ByVal ThreadingStyle As EHTTPSynchronisity, Optional ByVal options As Variant = Nothing, Optional ByVal Authenticator As stdICallable = Nothing)
+Friend Sub protInit(ByVal sURL As String, Optional ByVal RequestMethod As String = "GET", Optional ByVal ThreadingStyle As EHTTPSynchronisity, Optional ByVal options As Variant = Empty, Optional ByVal Authenticator As stdICallable = Nothing)
   #If Mac Then
     Call protInitMac(sURL, RequestMethod, ThreadingStyle, options, Authenticator)
   #Else
-    If IsEmpty(options) Or options Is Nothing Then options = CreateOptions()
+    If IsEmpty(options) Then options = CreateOptions()
     Set This.HTTP = CreateObject("WinHttp.WinHttpRequest.5.1")
     This.HTTP.Open RequestMethod, sURL, True
     Dim timeoutMS As Long: timeoutMS = options(stdHTTPOptionTimeoutMS)

@@ -799,26 +799,18 @@ End Property
 'Get a cookie value by URL/name, optionally narrowing by domain/path.
 Public Property Get Cookie( _
     ByVal Url As String, _
-    ByVal Name As String, _
-    Optional ByVal Domain As String = vbNullString, _
-    Optional ByVal Path As String = vbNullString) As String
+    ByVal Name As String) As String
 
     Dim i As Long
     Dim cookieName As String
-    Dim filterDomain As String
-    Dim filterPath As String
 
     cookieName = LCase$(Trim$(Name))
-    filterDomain = LCase$(Trim$(Domain))
-    filterPath = Trim$(Path)
     If LenB(cookieName) = 0 Then Err.Raise 5, "stdWebView::Cookie [Get]", "Name cannot be blank"
     If LenB(Trim$(Url)) = 0 Then Err.Raise 5, "stdWebView::Cookie [Get]", "Url cannot be blank"
 
     Call CookieQuery_LoadForUrl(Url)
     For i = 0 To This.cookie.count - 1
         If LCase$(This.cookie.records(i).Name) = cookieName Then
-            If LenB(filterDomain) > 0 And LCase$(This.cookie.records(i).Domain) <> filterDomain Then GoTo nextCookie
-            If LenB(filterPath) > 0 And This.cookie.records(i).Path <> filterPath Then GoTo nextCookie
             Cookie = This.cookie.records(i).Value
             Exit Property
         End If
@@ -970,7 +962,7 @@ Public Function CookiesForRequest(ByVal Url As String) As Variant
 End Function
 
 'Wait until current page is fully loaded and URL prefix is stable.
-'@param urlPrefix - Required URL prefix (case-insensitive). Pass "" to skip URL matching.
+'@param urlPrefix - Required URL prefix (case-insensitive). Comparison normalizes `http://` vs `https://` and a single leading `www.` on the host; actual navigation URLs are unchanged. Pass "" to skip URL matching.
 '@param timeoutMs - Max wait time in milliseconds.
 '@param stableMs - Consecutive milliseconds condition must remain true before success.
 '@param pollMs - Poll interval in milliseconds.
@@ -990,7 +982,7 @@ Public Function WaitForDocumentReady( _
     Dim hasPrefix As Boolean
 
     If Not IsReady Then Err.Raise 5, "stdWebView::WaitForDocumentReady", "WebView not ready"
-    requiredPrefix = LCase$(Trim$(urlPrefix))
+    requiredPrefix = UrlWaitPrefixNormalize(urlPrefix)
     If timeoutMs < 0 Then timeoutMs = 0
     If stableMs < 0 Then stableMs = 0
     If pollMs < 1 Then pollMs = 1
@@ -999,7 +991,7 @@ Public Function WaitForDocumentReady( _
     stableStart = -1#
 
     Do
-        currentUrl = LCase$(Trim$(Source))
+        currentUrl = UrlWaitPrefixNormalize(Source)
         hasPrefix = (LenB(requiredPrefix) = 0) Or (Left$(currentUrl, Len(requiredPrefix)) = requiredPrefix)
 
         If hasPrefix Then
@@ -1475,10 +1467,10 @@ Friend Sub protCreate(ByVal hwnd As LongPtr, Optional ByVal OnReady As stdICalla
         Err.Raise hr, "stdWebView", "CreateCoreWebView2EnvironmentWithOptions failed (" & CStr(hr) & ")"
     End If
     Dim j As Long
-    For j = 1 To 60000
-        If Not This.init.waiting Then Exit For
+    Do
+        If Not This.init.waiting Then Exit Do
         DoEvents
-    Next j
+    Loop
     If This.init.failed Or This.com.ppWebView2 = 0 Then
         Call CleanupFailedInit
         Err.Raise &H80040201, "stdWebView", "WebView2 initialization failed or timed out"
@@ -2318,6 +2310,22 @@ Private Sub CookieQuery_FreeHandlerAllocs()
     Call FreeHandlerThunks(This.cookie.thunks)
 End Sub
 
+'Normalize URL for WaitForDocumentReady prefix compare: lowercase, trim, strip http(s)://, strip one leading www.
+Private Function UrlWaitPrefixNormalize(ByVal url As String) As String
+    Dim s As String
+    s = LCase$(Trim$(url))
+    If LenB(s) = 0 Then Exit Function
+    If Left$(s, 8) = "https://" Then
+        s = Mid$(s, 9)
+    ElseIf Left$(s, 7) = "http://" Then
+        s = Mid$(s, 8)
+    End If
+    If Left$(s, 4) = "www." Then
+        s = Mid$(s, 5)
+    End If
+    UrlWaitPrefixNormalize = s
+End Function
+
 Private Function UrlHost(ByVal url As String) As String
     Dim s As String
     Dim startAt As Long
@@ -2952,5 +2960,6 @@ End Sub
 
 Private Sub Class_Terminate()
     On Error Resume Next
+    Call HostObjects_ClearAll
     Call Quit
 End Sub
